@@ -14,6 +14,7 @@ add_definitions(-DHAVE_BCMP=1  -DHAVE_BCOPY=1  )
 add_definitions(-U__APPLE__
 	-D__STDC_LIMIT_MACROS=1
 	-D__STDC_CONSTANT_MACROS=1
+	-DHAVE_EXECINFO_H=1
 	-D__DARWIN_UNIX03
 	-U__APPLE__
 	-U_DARWIN_C_SOURCE
@@ -69,3 +70,29 @@ set(lipo_sources
 
 add_executable(lipo ${lipo_sources})
 target_link_libraries(lipo m)
+
+# Host tool that edits load commands (dylib install names and dependencies) of Mach-O files; Darling's build
+# uses it to give prebuilt dylibs absolute dependency paths. The build's own copy of the cctools install_name_tool
+# for the guest is a different target.
+add_library(stuff_edit OBJECT
+	../libstuff/breakout.c
+	../libstuff/writeout.c
+	../libstuff/checkout.c
+	../libstuff/hash_string.c
+	../libstuff/reloc.c
+	../libstuff/crc32.c
+	../libstuff/lto.c
+	../libstuff/best_arch.c
+	../libstuff/guess_short_name.c
+	../libstuff/symbol_list.c
+	../libstuff/fatal_arch.c
+	../libstuff/ofile_get_word.c
+)
+
+add_executable(install_name_tool_host
+	install_name_tool.c
+	$<TARGET_OBJECTS:stuff>
+	$<TARGET_OBJECTS:stuff_edit>
+)
+set_target_properties(install_name_tool_host PROPERTIES OUTPUT_NAME "${APPLE_TARGET_TRIPLET_PRIMARY}-install_name_tool")
+target_link_libraries(install_name_tool_host m)

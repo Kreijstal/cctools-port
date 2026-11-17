@@ -1362,7 +1362,8 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 	bool is_blx;
 	bool is_b;
 	bool thumbTarget = false;
-	bool isRelative = false;
+	// a delta (target - from) is resolved at link time and never needs a chained fixup
+	bool isDelta = false;
 	std::map<uint32_t, const Fixup*> usedByHints;
 #if SUPPORT_ARCH_arm64e
 	Fixup::AuthData authData;
@@ -1370,7 +1371,7 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 	for (ld::Fixup::iterator fit = atom->fixupsBegin(), end=atom->fixupsEnd(); fit != end; ++fit) {
 		uint8_t* fixUpLocation = &buffer[fit->offsetInAtom];
 		if ( fit->firstInCluster() )
-			isRelative = false;
+			isDelta = false;
 		ld::Fixup::LOH_arm64 lohExtra;
 		switch ( (ld::Fixup::Kind)(fit->kind) ) { 
 			case ld::Fixup::kindNone:
@@ -1392,7 +1393,7 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 				delta = addressOf(state, fit, &fromTarget);
 				if ( ! fit->contentAddendOnly )
 					accumulator -= delta;
-				isRelative = true;
+				isDelta = true;
 				break;
 			case ld::Fixup::kindAddAddend:
 				if ( ! fit->contentIgnoresAddend ) {
@@ -1414,9 +1415,10 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 			case ld::Fixup::kindSetTargetImageOffset:
 				accumulator = addressOf(state, fit, &toTarget) - mhAddress;
 				thumbTarget = targetIsThumb(state, fit);
-				if ( thumbTarget ) 
+				if ( thumbTarget )
 					accumulator |= 1;
-				isRelative = true;
+				// an offset from the mach_header is resolved at link time too
+				isDelta = true;
 				break;
 			case ld::Fixup::kindSetTargetSectionOffset:
 				accumulator = sectionOffsetOf(state, fit);
@@ -1435,18 +1437,15 @@ void OutputFile::applyFixUps(ld::Internal& state, uint64_t mhAddress, const ld::
 				break;
 			case ld::Fixup::kindStoreLittleEndian32:
 				rangeCheckAbsolute32(accumulator, state, atom, fit);
-				// DARLING: as in newer ld64, a relative store (e.g. Swift's relative pointers, SUBTRACTOR/UNSIGNED
-				// pairs) is a resolved value, not a pointer, so it is written directly and never joins a fixup chain.
-				// An absolute 32-bit store still goes through setFixup32(), which rejects 64-bit chained formats.
-				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && (atom->contentType() != ld::Atom::ContentType::typeCFI)
+				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && !isDelta && (atom->contentType() != ld::Atom::ContentType::typeCFI)
 				 	&& (atom->section().type() != ld::Section::typeUnwindInfo) && (atom->section().type() != ld::Section::typeCode)
-				 	&& (atom->section().type() != ld::Section::typeDtraceDOF) && !isRelative )
+				 	&& (atom->section().type() != ld::Section::typeDtraceDOF)  )
 					setFixup32(fixUpLocation, accumulator, toTarget);
 				else
 					set32LE(fixUpLocation, accumulator);
 				break;
 			case ld::Fixup::kindStoreLittleEndian64:
-				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && (atom->contentType() != ld::Atom::ContentType::typeCFI) )
+				if ( _options.makeChainedFixups() && !fit->contentAddendOnly && !isDelta && (atom->contentType() != ld::Atom::ContentType::typeCFI) )
 					setFixup64(fixUpLocation, accumulator, toTarget);
 				else
 					set64LE(fixUpLocation, accumulator);
@@ -2687,8 +2686,9 @@ const ld::Atom* OutputFile::importAliasBase(const ld::Atom* target)
 	return target;
 }
 
+// An authenticated bind has no addend field (dyld_chained_ptr_arm64e_auth_bind), so its addend always goes in the import table.
 bool OutputFile::needsBind(const ld::Atom* toTarget, uint64_t* accumulator, uint64_t* inlineAddend,
-						   uint32_t* bindOrdinal, uint32_t* libOrdinal) const {
+						   uint32_t* bindOrdinal, uint32_t* libOrdinal, bool authenticated) const {
 	toTarget = importAliasBase(toTarget);
 	bool isBind = false;
 	bool isWeakBind = false;
@@ -2734,7 +2734,7 @@ bool OutputFile::needsBind(const ld::Atom* toTarget, uint64_t* accumulator, uint
 			// thumb bit should not be in addend
 			if ( toTarget->isThumb() )
 				*accumulator &= -2;
-			if ( chainedFixupAddendFitsInline(*accumulator, chainedPointerFormat()) ) {
+			if ( !authenticated && chainedFixupAddendFitsInline(*accumulator, chainedPointerFormat()) ) {
 				if ( inlineAddend != nullptr )
 					*inlineAddend = *accumulator;
 				*accumulator = 0;
@@ -2748,7 +2748,7 @@ bool OutputFile::needsBind(const ld::Atom* toTarget, uint64_t* accumulator, uint
 	}
 	else if ( isBind ) {
 		if ( accumulator != nullptr ) {
-			if ( chainedFixupAddendFitsInline(*accumulator, chainedPointerFormat()) ) {
+			if ( !authenticated && chainedFixupAddendFitsInline(*accumulator, chainedPointerFormat()) ) {
 				if ( inlineAddend != nullptr )
 					*inlineAddend = *accumulator;
 				*accumulator = 0;
@@ -2845,7 +2845,7 @@ void OutputFile::setFixup64e(uint8_t* fixUpLocation, uint64_t accumulator, Fixup
 {
 	uint32_t bindOrdinal = 0;
 	uint64_t inlineAddend = 0;
-	bool isBind = needsBind(toTarget, &accumulator, &inlineAddend, &bindOrdinal);
+	bool isBind = needsBind(toTarget, &accumulator, &inlineAddend, &bindOrdinal, nullptr, true);
 	switch ( chainedPointerFormat() ) {
 		case DYLD_CHAINED_PTR_ARM64E:
 			if ( isBind ) {
@@ -4975,12 +4975,14 @@ void OutputFile::buildChainedFixupInfo(ld::Internal& state)
 			bool hadSubtract;
 			uint64_t accumulator;
 			bool isBind = false;
+			bool isAuthBind = false;
 			for (ld::Fixup::iterator fit = atom->fixupsBegin(), end=atom->fixupsEnd(); fit != end; ++fit) {
 				if ( fit->firstInCluster() ) {
 					accumulator = 0;
 					target = NULL;
 					hadSubtract = false;
 					isBind = false;
+					isAuthBind = false;
 				}
 				if ( this->setsTarget(*fit) ) {
 					switch ( fit->binding ) {
@@ -5047,6 +5049,7 @@ void OutputFile::buildChainedFixupInfo(ld::Internal& state)
 							break;
 						}
 						isBind = true;
+						isAuthBind = true;
 						break;
 					case ld::Fixup::kindStoreTargetAddressLittleEndianAuth64:
 						if (_options.outputKind() == Options::kKextBundle ) {
@@ -5057,6 +5060,7 @@ void OutputFile::buildChainedFixupInfo(ld::Internal& state)
 						if ( fit->contentAddendOnly )
 							accumulator = 0;
 						isBind = true;
+						isAuthBind = true;
 						break;
 #endif
 					default:
@@ -5076,7 +5080,7 @@ void OutputFile::buildChainedFixupInfo(ld::Internal& state)
 						_chainedFixupSegments.back().pages[pageIndex].fixupOffsets.push_back(pageOffset);
 						// build map for binds
 						const ld::Atom* bindTarget = importAliasBase(target);
-						if ( needsBind(bindTarget, &accumulator) )
+						if ( needsBind(bindTarget, &accumulator, nullptr, nullptr, nullptr, isAuthBind) )
 							_chainedFixupBinds.ensureTarget(bindTarget, accumulator);
 					}
 				}
@@ -6954,8 +6958,8 @@ void OutputFile::ChainedFixupBinds::ensureTarget(const ld::Atom* atom, uint64_t 
 	_bindsTargets.push_back({atom, addend});
 	if ( addend > 0xFFFFFFFF )
 		_hasHugeAddends = true;
-	else if ( addend > 255 )
-		_hasLargeAddends = true;
+	else
+		_hasLargeAddends = true;		// any addend kept in the import table needs a format with an addend field
 }
 
 uint32_t OutputFile::ChainedFixupBinds::count() const

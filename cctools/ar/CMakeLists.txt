@@ -12,6 +12,7 @@ include_directories(AFTER ${CMAKE_CURRENT_SOURCE_DIR}/../include/foreign)
 add_definitions(-U__APPLE__
 	-D__STDC_LIMIT_MACROS=1
 	-D__STDC_CONSTANT_MACROS=1
+	-DHAVE_EXECINFO_H=1
 	-D__DARWIN_UNIX03
 	-U__APPLE__
 	-U_DARWIN_C_SOURCE
